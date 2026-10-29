@@ -1,59 +1,79 @@
-"""Preparação do Parent RAG para o desafio com Os Sertões.
+"""Parent RAG com busca nos filhos e contexto dos pais."""
 
-Este arquivo guarda o roteiro e lê as perguntas locais. A recuperação e a
-geração serão implementadas nas próximas etapas. O notebook importa esta base.
-"""
-
-from __future__ import annotations
-
+from dataclasses import dataclass
+import hashlib
 import json
 from pathlib import Path
 
-RAIZ = Path(__file__).resolve().parent
-TITULO = 'Parent RAG'
-STATUS = "Preparação inicial: o pipeline RAG ainda será implementado."
-
-# As etapas seguem a mesma ordem do notebook.
-ROTEIRO: tuple[tuple[str, str], ...] = (
-    ('1. Ambiente e configuração',
-     'Definir e instalar as dependências, selecionar modelos, carregar variáveis de ambiente e registrar versões e parâmetros. Não inserir chaves no notebook.'),
-    ('2. PDF e corpus',
-     'Baixar o PDF para `data/os-sertoes.pdf`, registrar seu hash e extrair o texto com fonte e páginas. Conferir a limpeza e separar os textos editoriais do corpus da obra.\n\nA execução deve localizar a raiz do repositório independentemente da pasta em que o Jupyter foi aberto.'),
-    ('3. Criar pais e filhos',
-     'A implementar: Dividir o texto em blocos maiores e subdividir cada bloco em trechos menores, com parent_id, child_id, fonte e páginas.'),
-    ('4. Indexar e armazenar',
-     'A implementar: Gerar embeddings apenas dos filhos e guardar os pais em um armazenamento consultável por parent_id.'),
-    ('5. Recuperar o contexto',
-     'A implementar: Buscar os filhos, resolver seus parent_ids, remover pais duplicados preservando a ordem de relevância e limitar o contexto sem perder a ligação com as páginas.'),
-    ('6. Prompt e geração',
-     'Montar o contexto com fontes e páginas. Responder em português, distinguir interpretações do autor de fatos atuais e indicar quando faltarem evidências. Usar o mesmo prompt base na comparação entre abordagens.'),
-    ('7. Perguntas do desafio',
-     'Carregar `evaluation/perguntas.json` e executar as cinco perguntas, preservando os identificadores.\n\n- **Q1:** Qual é a visão de Euclides da Cunha sobre o ambiente natural do sertão nordestino e como ele influencia a vida dos habitantes?\n- **Q2:** Quais são as principais características da população sertaneja descritas por Euclides da Cunha? Como ele relaciona essas características com o ambiente em que vivem?\n- **Q3:** Qual foi o contexto histórico e político que levou à Guerra de Canudos, segundo Euclides da Cunha?\n- **Q4:** Como Euclides da Cunha descreve a figura de Antônio Conselheiro e seu papel na Guerra de Canudos?\n- **Q5:** Quais são os principais aspectos da crítica social e política presentes em "Os Sertões"? Como esses aspectos refletem a visão do autor sobre o Brasil da época?'),
-    ('8. Avaliação e resultados',
-     'A consulta deve buscar os filhos e entregar seus pais ao modelo, com a relação entre os dois visível no notebook e sem repetir o mesmo pai no contexto.\n\nGuardar respostas, evidências, páginas, parâmetros, latência e uso de tokens quando disponível em `results/`. Conferir manualmente a sustentação das respostas no PDF.\n\nVamos comparar com o Naive RAG para verificar se o contexto mais amplo ajuda nas perguntas interpretativas e quanto aumenta o consumo de contexto.'),
-    ('9. Reprodução e conclusão',
-     'Reiniciar o kernel, executar todas as células em ordem e validar a recarga do índice. Documentar instalação e execução no README somente depois de verificar o fluxo completo. Registrar resultados reais e limitações.'),
-)
+from rag_base import Config, RAIZ, RAGBase, dividir_trechos
 
 
-def carregar_perguntas() -> list[dict[str, str]]:
-    """Lê as cinco perguntas, independentemente da pasta de execução."""
-    caminho = RAIZ / "evaluation" / "perguntas.json"
-    dados = json.loads(caminho.read_text(encoding="utf-8"))
-    return dados["perguntas"]
+@dataclass(frozen=True)
+class ParentConfig(Config):
+    parent_tokens: int = 1000
+    parent_overlap_tokens: int = 100
+    child_top_k: int = 16
+
+    def __post_init__(self):
+        super().__post_init__()
+        if not 0 <= self.parent_overlap_tokens < self.parent_tokens or self.parent_tokens <= self.chunk_tokens:
+            raise ValueError("Os pais devem ser maiores que os filhos, com sobreposição válida.")
+        if self.child_top_k < self.top_k:
+            raise ValueError("child_top_k deve ser maior ou igual a top_k.")
+
+    def assinatura(self):
+        dados = [super().assinatura(), self.parent_tokens, self.parent_overlap_tokens]
+        return hashlib.sha256(json.dumps(dados).encode()).hexdigest()
 
 
-def mostrar_preparacao() -> None:
-    """Mostra o andamento e o roteiro, sem executar o pipeline futuro."""
-    print(f"{TITULO} — Os Sertões")
-    print(STATUS)
-    print("\nEtapas:")
-    for titulo, _ in ROTEIRO:
-        print(f"  {titulo}")
-    print("\nPerguntas do desafio:")
-    for item in carregar_perguntas():
-        print(f"  {item['id']}: {item['pergunta']}")
+class ParentRAG(RAGBase):
+    abordagem = "parent"
+
+    def __init__(self, root: Path = RAIZ, config: ParentConfig | None = None):
+        super().__init__(root, config or ParentConfig.carregar(root))
+        self.pais = {}
+
+    def dividir_documentos(self, paginas):
+        pais = dividir_trechos(paginas, self.modelo.tokenizer, self.config,
+                              tamanho=self.config.parent_tokens,
+                              sobreposicao=self.config.parent_overlap_tokens)
+        self.pais = {pai["id"]: pai for pai in pais}
+        filhos = []
+        for pai in pais:
+            for filho in dividir_trechos([pai], self.modelo.tokenizer, self.config):
+                filho["parent_id"] = pai["id"]
+                filho["id"] = pai["id"] + "-" + filho["id"]
+                filhos.append(filho)
+        return filhos
+
+    def extras_indice(self):
+        return {"pais": self.pais}
+
+    def carregar_extras(self, extras):
+        self.pais = extras.get("pais", {})
+        if not self.pais or any(f.get("parent_id") not in self.pais for f in self.trechos):
+            raise ValueError("Relação entre pais e filhos inválida. Reconstrua o índice.")
+
+    def buscar(self, pergunta, top_k=None):
+        k = self.config.top_k if top_k is None else top_k
+        if k < 1:
+            raise ValueError("top_k deve ser positivo.")
+        filhos = super().buscar(pergunta, self.config.child_top_k)
+        encontrados = {}
+        for filho in filhos:
+            identificador = filho["parent_id"]
+            if identificador not in encontrados:
+                encontrados[identificador] = {**self.pais[identificador],
+                                              "similarity": filho["similarity"], "child_hits": []}
+            encontrados[identificador]["child_hits"].append(
+                {"id": filho["id"], "similarity": filho["similarity"]})
+        resultado = list(encontrados.values())[:k]
+        self.ultima_busca = {"filhos_recuperados": len(filhos),
+                             "pais_unicos": len(encontrados),
+                             "pais_selecionados": [p["id"] for p in resultado]}
+        return resultado
 
 
 if __name__ == "__main__":
-    mostrar_preparacao()
+    from cli import executar
+    raise SystemExit(executar(ParentRAG))
